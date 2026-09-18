@@ -52,8 +52,17 @@ import threading
 import signal
 import ctypes
 import errno
+import shutil
+import stat
+import select
 from queue import Queue
 
+"""
+Set PHC_DEBUG=1 to make phc explain itself on stderr: which clang-offload-bundler
+and which -targets list it read back from the driver, whether it found a usable
+jobserver and how many jobs it will run at once, and why it decided to fall back
+to a plain serial compile. Useful when a build produces an unexpected object.
+"""
 DEBUG = os.environ.get("PHC_DEBUG", "0") not in ("", "0")
 
 """
@@ -67,6 +76,17 @@ def debug(message):
     if DEBUG:
         print(f"phc: {message}", file=sys.stderr)
 
+class FallbackToSerial(Exception):
+    """
+    Raised when phc cannot be confident that reassembling the compilation by hand
+    would produce exactly what the compiler driver itself would have produced:
+    no usable clang-offload-bundler, an unexpected -### output, a -targets list
+    that does not match our architectures, a failing bundler run, ...
+
+    Failing the build is never the right answer in those cases, because the
+    original command is always a valid way to produce the object -- only slower.
+    main() catches this and runs the unmodified command.
+    """
 
 """
 None, or an open handle to a file to write ninja-style logs. These can be post-processed
@@ -421,6 +441,28 @@ async def run(cmd):
             stderr=stderr,
         )
 
+async def run_capture(cmd):
+    """
+    Run a command and return (returncode, stdout, stderr) as text, printing nothing.
+    Used for the -### probe, whose output is phc's input rather than the user's.
+
+    Never raises: a command that cannot even be started is reported like any other
+    failure, and the caller falls back to something that works.
+    """
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as error:
+        return 1, "", str(error)
+
+    stdout, stderr = await process.communicate()
+    return (process.returncode,
+            stdout.decode("utf-8", "replace"),
+            stderr.decode("utf-8", "replace"))
+
 async def main():
     """
     Main entry point for the compiler launcher. Arguments are passed via sys.argv.
@@ -476,151 +518,382 @@ async def main():
         await run(cmd)
         return
 
+    # Everything below reassembles by hand what the compiler driver would have done
+    # internally. Whenever that turns out not to be reproducible faithfully, run the
+    # original command instead: it is slower, but it is never wrong, and a build is
+    # not the place to be pedantic about it.
+    spec = CompileSpec(cmd)
+    try:
+        await compile_parallel(cmd, offload_archs, spec)
+    except FallbackToSerial as reason:
+        debug(f"falling back to a plain serial compile: {reason}")
+        await run(cmd)
+
+class CompileSpec:
+    """
+    The handful of things phc has to know about a compile command.
+
+    The command line is scanned once, left to right, because several of these are
+    last-one-wins (a repeated -o) and several take a
+    separate argument that must not be mistaken for a flag (-MF x.d).
+    """
+
+    def __init__(self, cmd):
+        # The final object. On the whole-program path the host compilation writes it
+        # directly and this is only used to name trace entries, but on the RDC path
+        # phc writes it itself with the bundler, so there it has to be known.
+        self.output = "a.out"
+        self.have_output = False
+
+        # Only used by the fallback in compile_parallel() for a toolchain whose -###
+        # names no bundler; normally the compression flags are mirrored from the
+        # driver's own bundler command line.
+        self.offload_compress = False
+        self.offload_compression_level = None
+
+        # Dependency file generation, which is a property of the host compilation.
+        self.depfile = False          # -MD/-MMD: a dependency file is wanted
+        self.depfile_named = False    # -MF: the caller said where it goes
+        self.depfile_target = False   # -MT/-MQ: the caller said what rule it is for
+
+        it = iter(cmd)
+        for arg in it:
+            if arg == "-o":
+                self.output = next(it, self.output)
+                self.have_output = True
+            elif arg.startswith("-o"):
+                self.output = arg[2:]
+                self.have_output = True
+            elif arg == "--offload-compress":
+                self.offload_compress = True
+            elif arg.startswith("--offload-compression-level="):
+                self.offload_compression_level = arg.split("=")[-1]
+            elif arg in ("-MD", "-MMD"):
+                self.depfile = True
+            elif arg == "-MF":
+                self.depfile_named = True
+                next(it, None)
+            elif arg in ("-MT", "-MQ"):
+                self.depfile_target = True
+                next(it, None)
+
+class DriverInfo:
+    """
+    What the compiler driver itself says it would do for a given command line.
+
+    phc puts the pieces of a compilation back together by hand, so every detail that
+    ends up in the final object is read back from the driver with -### (which prints
+    the sub-commands it would run, without running them) rather than guessed:
+
+    bundler       the clang-offload-bundler belonging to *this* toolchain. It cannot
+                  be derived from the compiler's path: on the ROCm builds CMSSW uses,
+                  hipcc lives in rocm-hip/bin while the bundler lives in
+                  rocm-llvm/lib/llvm/bin, and the clang-offload-bundler that happens
+                  to be in PATH belongs to a different LLVM altogether.
+    targets       the canonical -targets list. Its spelling depends on the toolchain
+                  *and* on the mode -- `hipv4-amdgcn-amd-amdhsa--gfx942:sramecc+`
+                  with `host-x86_64-unknown-linux-gnu` for a whole-program compile,
+                  but `hip-amdgcn-amd-amdhsa-unknown-gfx942:sramecc+` with
+                  `host-x86_64-redhat-linux-gnu` for an -fgpu-rdc one -- and the host
+                  part is the distribution's own triple, not a fixed string. Their
+                  order is significant too, and it differs between the two modes.
+    bundle_extra  whatever else the driver hands to its bundler.
+
+    One -### run costs about 50 ms and compiles nothing, which is negligible next to
+    the multi-second compilation it makes correct.
+    """
+
+    def __init__(self):
+        self.bundler = None
+        self.targets = None
+        self.bundle_extra = []
+
+# A single "quoted argument" of a -### command line, with \" and \\ escapes.
+DRIVER_ARGUMENT = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+async def probe_driver(cmd, extra=()):
+    """
+    Ask the driver what it would do for this command line and return a DriverInfo.
+    Fields that could not be found are left as None; the caller decides whether it
+    can live without them.
+
+    `extra` holds the arguments phc is going to add to each of its sub-compiles, so
+    that the probe answers for the command line that will actually be used -- and so
+    that a driver which does not understand them produces no bundler here rather than
+    an error later.
+    """
+    returncode, stdout, stderr = await run_capture(list(cmd) + list(extra) + ["-###"])
+
+    info = DriverInfo()
+    # -### goes to stderr, but be forgiving about where a wrapper puts it.
+    for line in (stderr + "\n" + stdout).splitlines():
+        # Undo the \" and \\ escaping the driver applies inside each argument.
+        args = [re.sub(r"\\(.)", r"\1", m.group(1))
+                for m in DRIVER_ARGUMENT.finditer(line)]
+        if not args:
+            continue
+
+        if info.bundler is None and os.path.basename(args[0]).startswith("clang-offload-bundler"):
+            if not os.path.isfile(args[0]):
+                continue
+            info.bundler = args[0]
+            for arg in args[1:]:
+                if arg.startswith("-targets="):
+                    info.targets = arg[len("-targets="):].split(",")
+                elif arg.startswith(("-input=", "-output=", "-type=")):
+                    # Supplied by us, not copied from the driver.
+                    pass
+                else:
+                    # Everything else the driver passes to its bundler is mirrored:
+                    # -bundle-align=4096 for a fat binary, --compress and
+                    # --compression-level= when they were asked for. Mirroring beats
+                    # hardcoding because it differs per mode -- this ROCm passes
+                    # -bundle-align only for the whole-program bundle -- and a flag
+                    # the driver would not have passed produces an object the driver
+                    # would never have produced.
+                    info.bundle_extra.append(arg)
+
+    if info.bundler is None:
+        debug(f"the driver named no clang-offload-bundler in its -### output "
+              f"(exit status {returncode})")
+    return info
+
+def legacy_bundler_path(cmd):
+    """
+    Look for a clang-offload-bundler next to the compiler. Only used when the -###
+    output named none, e.g. on a toolchain that does not bundle at compile time.
+
+    This deliberately does not search PATH. The clang-offload-bundler in PATH often
+    belongs to a different LLVM than the one the driver uses -- in the CMSSW ROCm
+    builds it is a separate llvm package entirely -- and bundling with the wrong
+    version corrupts silently instead of failing.
+    """
+    compiler = cmd[0]
+    if os.path.dirname(compiler) == "":
+        compiler = shutil.which(compiler) or compiler
+    clang_dir = os.path.dirname(os.path.realpath(compiler))
+
+    for candidate in (
+        os.path.join(clang_dir, "clang-offload-bundler"),
+        os.path.join(clang_dir, "..", "llvm", "bin", "clang-offload-bundler"),
+        os.path.join(clang_dir, "..", "lib", "llvm", "bin", "clang-offload-bundler"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+
+    raise FallbackToSerial("could not find clang-offload-bundler")
+
+def bundle_inputs(targets, device_inputs, host_input):
+    """
+    Return the -input= arguments in the order the driver's -targets list dictates.
+
+    clang-offload-bundler matches inputs to targets by position, so this order is not
+    cosmetic: the driver puts the host entry first in a whole-program fat binary and
+    last in an RDC object.
+
+    An entry starting with `host-` takes the host input. For any other the
+    architecture is the text after the *last* '-': gfx names never contain a '-', but
+    they do contain ':' and '+', as in hip-amdgcn-amd-amdhsa-unknown-gfx90a:sramecc+.
+    """
+    if len(targets) != len(device_inputs) + 1:
+        raise FallbackToSerial(f"the driver listed {len(targets)} targets "
+                               f"for {len(device_inputs)} architecture(s)")
+
+    inputs = []
+    matched = set()
+    for target in targets:
+        if target.startswith("host-"):
+            inputs.append(f"-input={host_input}")
+            continue
+        arch = target.rsplit("-", 1)[-1]
+        if arch not in device_inputs:
+            raise FallbackToSerial(f"target '{target}' matches none of the "
+                                   f"requested architectures")
+        matched.add(arch)
+        inputs.append(f"-input={device_inputs[arch]}")
+
+    if len(matched) != len(device_inputs):
+        raise FallbackToSerial("the driver's target list does not name every architecture")
+    return inputs
+
+async def run_bundler(bundle_cmd):
+    """
+    Run clang-offload-bundler. A failure here is not the user's fault and not worth
+    failing a build over, so it turns into a plain serial compile.
+    """
+    try:
+        await run(bundle_cmd)
+    except subprocess.CalledProcessError as error:
+        raise FallbackToSerial(f"clang-offload-bundler exited with {error.returncode}")
+
+async def compile_parallel(cmd, offload_archs, spec):
+    """
+    Compile one translation unit as one device compilation per architecture plus a
+    single host compilation, and reassemble the result.
+
+    Raises FallbackToSerial if that cannot be done faithfully. Exits with status 1 if
+    one of the sub-compilations reported a genuine compile error (already printed).
+    """
     # When compiling different compilation units separately, each one needs a 'CUID'
     # passed to it to help identify which compilation unit an object is part of.
     # Usually this is passed by the clang driver, but since we are emulating the driver
     # we need to pass it ourselves.
     cuid = os.urandom(8).hex()
 
-    # Try to find the offload bundler. Its usually next to the compiler, but be sure
-    # to resolve any symlinks first (for example if the compiler is /usr/bin/hipcc).
-    clang_dir = os.path.dirname(os.path.realpath(cmd[0]))
-    offload_bundler = os.path.join(clang_dir, "clang-offload-bundler")
-    if not os.path.isfile(offload_bundler):
-        offload_bundler = os.path.join(clang_dir, "..", "llvm", "bin", "clang-offload-bundler")
-    if not os.path.isfile(offload_bundler):
-        raise ValueError("could not find clang-offload-bundler")
+    # Ask the driver what it would do; see DriverInfo for why none of this is guessed.
+    info = await probe_driver(cmd)
+    bundler = info.bundler or legacy_bundler_path(cmd)
 
-    # Figure out the main output file. We'll mainly use this for logging trace info about
-    # when a file was compiled.
+    if info.targets is not None:
+        targets = info.targets
+        bundle_extra = info.bundle_extra
+    else:
+        # The original hardcoded spellings, kept for toolchains whose -### does not
+        # mention a bundler at all. They assume an x86_64 Linux host.
+        debug("no -targets from the driver, using the built-in whole-program spellings")
+        targets = ["host-x86_64-unknown-linux-"] + \
+                  [f"hipv4-amdgcn-amd-amdhsa--{arch}" for arch in offload_archs]
+        bundle_extra = ["-bundle-align=4096"]
+        if spec.offload_compress:
+            bundle_extra.append("-compress")
+        if spec.offload_compression_level is not None:
+            bundle_extra.append(f"-compression-level={spec.offload_compression_level}")
 
-    # Figure out some common things from the compile command:
-    # - The main output file. We'll mainly use this for logging trace info about when a file
-    #   was compiled.
-    # - The offload compression level. Because we're packaging the offload bundle manually,
-    #   we'll have to pass relevant parameters to that command.
-
-    it = iter(cmd)
-    host_output = "a.out"
-    offload_compress = False
-    offload_compression_level = None
-    for arg in it:
-        if arg == "-o":
-           host_output = next(it)
-        elif arg.startswith("-o"):
-           host_output = arg[2:]
-        elif arg == "--offload-compress":
-            offload_compress = True
-        elif arg.startswith('--offload-compression-level='):
-            offload_compression_level = arg.split('=')[-1]
+    debug(f"bundler: {bundler}")
+    debug(f"targets: {','.join(targets)}")
+    debug(f"cuid:    {cuid}")
+    debug(f"mode:    whole program, "
+          f"{len(offload_archs)} architectures: {' '.join(offload_archs)}")
 
     with open_jobserver(len(offload_archs)) as jobclient:
-        with tempfile.TemporaryDirectory(prefix="phc-") as dir:
 
-            # We can't let the main thread idle because that might actually cause a deadlock
-            # (if all main threads are idling they are wasting their implicit job slot token).
-            # Therefore we are also going to process offload compilation tasks on the main
-            # thread. The work is divided using a work-stealing method and two 'scheduler's.
-            # `main_scheduler()` runs tasks on the main thread, while `jobserver_scheduler()`
-            # tries to acquire job slots and launch new async jobs if so.
-            # `tasks` is the queue of compilation jobs to finish. `error_event` is an asyncio
-            # event used to indicate that any job failed. We'll check it later after syncing
-            # with the queue.
+        # Tokens must go back even if this process is interrupted. A token that is not
+        # returned is gone for the rest of the build, and what then hangs is not this
+        # compilation but some later target waiting for a slot that no longer exists.
+        saved_handlers = {}
 
-            tasks = asyncio.Queue()
-            error_event = asyncio.Event()
+        def terminate(signum, _frame):
+            jobclient.release_all()
+            signal.signal(signum, saved_handlers.get(signum, signal.SIG_DFL))
+            os.kill(os.getpid(), signum)
 
-            # Create the compilation tasks.
-            for arch in offload_archs:
-                output = os.path.join(dir, f"{arch}.out")
-                tasks.put_nowait(compile_device(cmd, arch, output, cuid, host_output, error_event))
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            try:
+                saved_handlers[signum] = signal.signal(signum, terminate)
+            except (ValueError, OSError):
+                pass
 
-            # Launch our schedulers.
-            asyncio.create_task(main_scheduler(tasks))
-            jobserver_scheduler_task = asyncio.create_task(jobserver_scheduler(tasks, jobclient))
+        try:
+            with tempfile.TemporaryDirectory(prefix="phc-") as dir:
 
-            # Wait for all tasks to be done processing.
-            # We don't need to wait for the schedulers to finish, because tasks.task_done() is only
-            # called _after_ the object is properly compiled.
-            await tasks.join()
+                # We can't let the main thread idle because that might actually cause a deadlock
+                # (if all main threads are idling they are wasting their implicit job slot token).
+                # Therefore we are also going to process offload compilation tasks on the main
+                # thread. The work is divided using a work-stealing method and two 'scheduler's.
+                # `main_scheduler()` runs tasks on the main thread, while `jobserver_scheduler()`
+                # tries to acquire job slots and launch new async jobs if so.
+                # `tasks` is the queue of compilation jobs to finish. `error_event` is an asyncio
+                # event used to indicate that any job failed. We'll check it later after syncing
+                # with the queue.
 
-            # Cancel the jobserver scheduler task: This is needed if the main thread completed the
-            # last task and the job server is currently exhausted. In that case, there is currently
-            # a background thread blocking on jobserver.acquire, and we have to cancel that to cleanly
-            # exit this program. See `jobserver_scheduler()` for more details.
-            jobserver_scheduler_task.cancel()
+                tasks = asyncio.Queue()
+                error_event = asyncio.Event()
 
-            # tasks.task_done() is called after any potential changes to error_event, so we can
-            # check here if its set.
-            if error_event.is_set():
-                # Note: error is already printed.
-                sys.exit(1)
+                # Where each architecture's device code lands. The RDC path puts bitcode
+                # here and the whole-program path a code object, but neither the name nor
+                # compile_device() has to care.
+                device_inputs = {arch: os.path.join(dir, f"{arch}.out") for arch in offload_archs}
 
-            start = time.time()
+                # Create the compilation tasks.
+                for arch in offload_archs:
+                    tasks.put_nowait(compile_device(cmd, arch, device_inputs[arch], cuid,
+                                                    spec.output, error_event))
 
-            # The remainder of the commands are all serially executed within the same jobserver
-            # task, the main thread of this process.
+                # Launch our schedulers.
+                asyncio.create_task(main_scheduler(tasks))
+                jobserver_scheduler_task = asyncio.create_task(jobserver_scheduler(tasks, jobclient))
 
-            # Now manually combine the inputs into an offload bundle.
-            # Note: We also have to pass the host target (x86_64 most likely) and corresponding
-            # input (-input=/dev/null). This is not used by HIP internally, but the bundle still
-            # needs the entry for some reason.
-            bundle = os.path.join(dir, "bundle.hipfb")
-            bundle_cmd = [offload_bundler, "-type=o", "-bundle-align=4096", f"-output={bundle}", "-targets=host-x86_64-unknown-linux-"]
-            # Append the device targets for each architecture.
-            bundle_cmd[-1] += ''.join([f",hipv4-amdgcn-amd-amdhsa--{arch}" for arch in offload_archs])
-            bundle_cmd.append("-input=/dev/null")
-            # And the device code objects for each architecture, in the same order.
-            bundle_cmd.extend(["-input=" + os.path.join(dir, f"{arch}.out") for arch in offload_archs])
+                # Wait for all tasks to be done processing.
+                # We don't need to wait for the schedulers to finish, because tasks.task_done() is only
+                # called _after_ the object is properly compiled.
+                await tasks.join()
 
-            # Add in the compression options, if available.
-            if offload_compress:
-                bundle_cmd.append("-compress")
-            if offload_compression_level is not None:
-                bundle_cmd.append(f"-compression-level={offload_compression_level}")
+                # Cancel the jobserver scheduler task: This is needed if the main thread completed the
+                # last task and the job server is currently exhausted. In that case, there is currently
+                # a background thread blocking on jobserver.acquire, and we have to cancel that to cleanly
+                # exit this program. See `jobserver_scheduler()` for more details.
+                jobserver_scheduler_task.cancel()
 
-            await run(bundle_cmd)
+                # tasks.task_done() is called after any potential changes to error_event, so we can
+                # check here if its set. (Note: this used to call .set(), which always returns
+                # None, so a device compile error was only noticed later, as a confusing
+                # failure of the bundler.)
+                if error_event.is_set():
+                    # Note: error is already printed.
+                    sys.exit(1)
 
-            bundle_end = time.time()
-            trace(start, bundle_end, f"{host_output}::bundle")
+                start = time.time()
 
-            # Compile the final executable.
-            # Preprocess the host compilation command.
-            host_cmd = []
-            for arg in cmd:
-                # This time, we don't need to include any GPU targets to compile for, as we're only
-                # targeting the host. We can leave the MF/MD/MT and -o options in place this time,
-                # we actually want to emit the dependency info as well as put the object in the
-                # original output location.
-                if arg.startswith("--offload-arch="):
-                    pass
-                # Also get rid of --offload-jobs, its not needed anymore.
-                elif arg.startswith("--offload-jobs="):
-                    pass
-                # Skip any flags related to compression, we'll do that later.
-                elif arg == "--offload-compress":
-                    pass
-                elif arg.startswith("--offload-compression-level"):
-                    pass
-                # Pass on any other options.
-                else:
-                    host_cmd.append(arg)
+                # The remainder of the commands are all serially executed within the same jobserver
+                # task, the main thread of this process.
 
-            # Only compile the host part of the input file, ignore any device code.
-            host_cmd.append("--offload-host-only")
-            # Ask clang to embed the offload bundle that we produced earlier. Note: this must be
-            # passed to cc1 via -Xclang.
-            host_cmd.append("-Xclang")
-            host_cmd.append("-fcuda-include-gpubinary")
-            host_cmd.append("-Xclang")
-            host_cmd.append(bundle)
-            # Also pass the CUID to cc1 with the same method.
-            host_cmd.append("-Xclang")
-            host_cmd.append(f"-cuid={cuid}")
-            await run(host_cmd)
+                # Whole-program compilation. The device code is packed into a fat
+                # binary which the host compilation then embeds, and the host
+                # compilation writes the final object itself.
+                #
+                # Note: the bundle also needs an entry for the host target, even
+                # though HIP does not use it, hence the -input=/dev/null that
+                # bundle_inputs() places wherever the driver puts the host target.
+                bundle = os.path.join(dir, "bundle.hipfb")
+                bundle_cmd = [bundler, "-type=o"] + bundle_extra + \
+                    ["-targets=" + ",".join(targets)] + \
+                    bundle_inputs(targets, device_inputs, "/dev/null") + \
+                    [f"-output={bundle}"]
+                await run_bundler(bundle_cmd)
 
-            host_end = time.time()
-            trace(bundle_end, host_end, host_output)
+                bundle_end = time.time()
+                trace(start, bundle_end, f"{spec.output}::bundle")
+
+                # Compile the final executable.
+                # Preprocess the host compilation command.
+                host_cmd = []
+                for arg in cmd:
+                    # This time, we don't need to include any GPU targets to compile for, as we're only
+                    # targeting the host. We can leave the MF/MD/MT and -o options in place this time,
+                    # we actually want to emit the dependency info as well as put the object in the
+                    # original output location.
+                    if arg.startswith("--offload-arch="):
+                        pass
+                    # Also get rid of --offload-jobs, its not needed anymore.
+                    elif arg.startswith("--offload-jobs="):
+                        pass
+                    # Skip any flags related to compression, we'll do that later.
+                    elif arg == "--offload-compress":
+                        pass
+                    elif arg.startswith("--offload-compression-level"):
+                        pass
+                    # Pass on any other options.
+                    else:
+                        host_cmd.append(arg)
+
+                # Only compile the host part of the input file, ignore any device code.
+                host_cmd.append("--offload-host-only")
+                # Ask clang to embed the offload bundle that we produced earlier. Note: this must be
+                # passed to cc1 via -Xclang.
+                host_cmd.append("-Xclang")
+                host_cmd.append("-fcuda-include-gpubinary")
+                host_cmd.append("-Xclang")
+                host_cmd.append(bundle)
+                # And the CUID, as a driver option (see above).
+                host_cmd.append("-Xclang")
+                host_cmd.append(f"-cuid={cuid}")
+                await run(host_cmd)
+
+                host_end = time.time()
+                trace(bundle_end, host_end, spec.output)
+        finally:
+            for signum, handler in saved_handlers.items():
+                signal.signal(signum, handler)
 
 async def main_scheduler(queue):
     """
@@ -767,8 +1040,8 @@ async def compile_device(cmd, arch, output, cuid, host_output, error_event):
     output:
         The location to place the output for the compilation for this architecture.
     cuid:
-        The Compilation Unit ID. Must be the same for the host and device compilation of the
-        same compilation unit.
+        The Compilation Unit ID. Must be the same for the host and the device
+        compilation of the same compilation unit.
     host_output:
         The host output corresponding to this compilation. This is mainly used for tracing.
     error_event:
@@ -792,7 +1065,9 @@ async def compile_device(cmd, arch, output, cuid, host_output, error_event):
         # these options if they are passed with a device-only compilation.
         elif arg == "-MD" or arg == "-MMD":
             pass
-        elif arg == "-MT" or arg == "-MQ" or arg == "-MF":
+        # -MQ takes an argument just like -MT and -MF does; leaving it behind would
+        # hand the device compilation a stray extra input file.
+        elif arg == "-MT" or arg == "-MF" or arg == "-MQ":
              next(it)
         # Get rid of the original output file. We'll add the new one later.
         elif arg == "-o":
@@ -812,7 +1087,8 @@ async def compile_device(cmd, arch, output, cuid, host_output, error_event):
     new_cmd.append(f"--offload-arch={arch}")
     # Only compile the device part of the source file.
     new_cmd.append("--offload-device-only")
-    # Pass the CUID also.
+    # Pass the CUID also. Note that this is a driver option, not -Xclang: see the
+    # comment where it is computed in compile_parallel().
     new_cmd.append("-Xclang")
     new_cmd.append(f"-cuid={cuid}")
     # Don't package the output in an offload bundle for us: We're going to manually put
