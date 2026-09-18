@@ -551,6 +551,10 @@ class CompileSpec:
         self.offload_compress = False
         self.offload_compression_level = None
 
+        # A compilation unit id supplied by the caller, which always wins over one
+        # phc would pick itself.
+        self.cuid = None
+
         # Dependency file generation, which is a property of the host compilation.
         self.depfile = False          # -MD/-MMD: a dependency file is wanted
         self.depfile_named = False    # -MF: the caller said where it goes
@@ -568,6 +572,8 @@ class CompileSpec:
                 self.offload_compress = True
             elif arg.startswith("--offload-compression-level="):
                 self.offload_compression_level = arg.split("=")[-1]
+            elif arg.startswith("-cuid="):
+                self.cuid = arg[len("-cuid="):]
             elif arg in ("-MD", "-MMD"):
                 self.depfile = True
             elif arg == "-MF":
@@ -598,6 +604,10 @@ class DriverInfo:
                   part is the distribution's own triple, not a fixed string. Their
                   order is significant too, and it differs between the two modes.
     bundle_extra  whatever else the driver hands to its bundler.
+    cuid          the compilation unit id the driver picked. Every cc1 invocation of
+                  one translation unit has to share it, and our host-only and
+                  device-only command lines would otherwise each hash a different one
+                  out of their own (differing) arguments.
 
     One -### run costs about 50 ms and compiles nothing, which is negligible next to
     the multi-second compilation it makes correct.
@@ -607,6 +617,7 @@ class DriverInfo:
         self.bundler = None
         self.targets = None
         self.bundle_extra = []
+        self.cuid = None
 
 # A single "quoted argument" of a -### command line, with \" and \\ escapes.
 DRIVER_ARGUMENT = re.compile(r'"((?:[^"\\]|\\.)*)"')
@@ -632,6 +643,12 @@ async def probe_driver(cmd, extra=()):
                 for m in DRIVER_ARGUMENT.finditer(line)]
         if not args:
             continue
+
+        if info.cuid is None:
+            for arg in args:
+                if arg.startswith("-cuid="):
+                    info.cuid = arg[len("-cuid="):]
+                    break
 
         if info.bundler is None and os.path.basename(args[0]).startswith("clang-offload-bundler"):
             if not os.path.isfile(args[0]):
@@ -738,10 +755,29 @@ async def compile_parallel(cmd, offload_archs, spec):
     # passed to it to help identify which compilation unit an object is part of.
     # Usually this is passed by the clang driver, but since we are emulating the driver
     # we need to pass it ourselves.
-    cuid = os.urandom(8).hex()
+    #
+    # It has to be passed as a *driver* option. Passing it to cc1 with -Xclang, as this
+    # script used to, does not work: the driver appends its own generated -cuid after
+    # our arguments and the last one wins. The symptom is subtle -- the object still
+    # compiles, links and runs -- but every architecture's bundle then carries a
+    # different __hip_cuid_<hash>, where a plain compile gives all of them the same
+    # one, and the hash changes on every rebuild because the driver derives it from the
+    # command line, which for our sub-compiles names a fresh temporary directory.
+    #
+    # A caller-supplied -cuid= always wins. Otherwise derive one from the command line,
+    # deterministically, so that recompiling an unchanged file reproduces the object
+    # bit for bit (which is what makes the result cacheable and diffable).
+    cuid = spec.cuid
+    if cuid is None:
+        seed = os.path.abspath(spec.output) + "\0" + "\0".join(cmd)
+        cuid = hashlib.sha256(seed.encode("utf-8", "replace")).hexdigest()[:16]
+        cuid_args = [f"-cuid={cuid}"]
+    else:
+        # Already on the command line; adding it again would only be noise.
+        cuid_args = []
 
     # Ask the driver what it would do; see DriverInfo for why none of this is guessed.
-    info = await probe_driver(cmd)
+    info = await probe_driver(cmd, cuid_args)
     bundler = info.bundler or legacy_bundler_path(cmd)
 
     if info.targets is not None:
@@ -758,6 +794,11 @@ async def compile_parallel(cmd, offload_archs, spec):
             bundle_extra.append("-compress")
         if spec.offload_compression_level is not None:
             bundle_extra.append(f"-compression-level={spec.offload_compression_level}")
+
+    if info.cuid is not None and info.cuid != cuid:
+        # The driver did not take our -cuid=. Nothing is broken by this -- it is what
+        # this script always did -- but the object will not be reproducible.
+        debug(f"the driver kept its own cuid {info.cuid} instead of {cuid}")
 
     debug(f"bundler: {bundler}")
     debug(f"targets: {','.join(targets)}")
@@ -806,7 +847,7 @@ async def compile_parallel(cmd, offload_archs, spec):
 
                 # Create the compilation tasks.
                 for arch in offload_archs:
-                    tasks.put_nowait(compile_device(cmd, arch, device_inputs[arch], cuid,
+                    tasks.put_nowait(compile_device(cmd, arch, device_inputs[arch], cuid_args,
                                                     spec.output, error_event))
 
                 # Launch our schedulers.
@@ -885,8 +926,7 @@ async def compile_parallel(cmd, offload_archs, spec):
                 host_cmd.append("-Xclang")
                 host_cmd.append(bundle)
                 # And the CUID, as a driver option (see above).
-                host_cmd.append("-Xclang")
-                host_cmd.append(f"-cuid={cuid}")
+                host_cmd.extend(cuid_args)
                 await run(host_cmd)
 
                 host_end = time.time()
@@ -1026,7 +1066,7 @@ async def jobserver_worker(task, queue, jobclient, token):
         finally:
             queue.task_done()
 
-async def compile_device(cmd, arch, output, cuid, host_output, error_event):
+async def compile_device(cmd, arch, output, cuid_args, host_output, error_event):
     """
     Asynchronously compile the device code of a source file for a particular architecure.
 
@@ -1039,9 +1079,10 @@ async def compile_device(cmd, arch, output, cuid, host_output, error_event):
         The architecture to compile this object for.
     output:
         The location to place the output for the compilation for this architecture.
-    cuid:
-        The Compilation Unit ID. Must be the same for the host and the device
-        compilation of the same compilation unit.
+    cuid_args:
+        The arguments that pin the Compilation Unit ID, which must be the same for the host
+        and the device compilation of one compilation unit. Empty if the caller already
+        passed a -cuid= of its own.
     host_output:
         The host output corresponding to this compilation. This is mainly used for tracing.
     error_event:
@@ -1089,8 +1130,7 @@ async def compile_device(cmd, arch, output, cuid, host_output, error_event):
     new_cmd.append("--offload-device-only")
     # Pass the CUID also. Note that this is a driver option, not -Xclang: see the
     # comment where it is computed in compile_parallel().
-    new_cmd.append("-Xclang")
-    new_cmd.append(f"-cuid={cuid}")
+    new_cmd.extend(cuid_args)
     # Don't package the output in an offload bundle for us: We're going to manually put
     # all of the architectures together, this saves a few unbundling steps.
     new_cmd.append(f"--no-gpu-bundle-output")
