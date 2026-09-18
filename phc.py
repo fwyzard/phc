@@ -14,7 +14,8 @@ To use the script, simply prepend it to your compile command. For example:
 
 Note that parallel compilation is only activated when (1) an object file is compiled
 (by passing -c), and (2) multiple explicit --offload-arch= options are passed to the
-compiler. The result is byte-for-byte what the compiler driver itself would have
+compiler. Both whole-program and relocatable device code (-fgpu-rdc) compilations are
+supported; the result is byte-for-byte what the compiler driver itself would have
 produced. Whenever the split cannot be done faithfully, the original command is run
 unchanged rather than failing the build.
 
@@ -534,7 +535,7 @@ class CompileSpec:
     The handful of things phc has to know about a compile command.
 
     The command line is scanned once, left to right, because several of these are
-    last-one-wins (a repeated -o) and several take a
+    last-one-wins (-fgpu-rdc against -fno-gpu-rdc, repeated -o) and several take a
     separate argument that must not be mistaken for a flag (-MF x.d).
     """
 
@@ -544,6 +545,11 @@ class CompileSpec:
         # phc writes it itself with the bundler, so there it has to be known.
         self.output = "a.out"
         self.have_output = False
+
+        # Relocatable device code. -fno-gpu-rdc may follow -fgpu-rdc on the command
+        # line and then wins, so keep the last occurrence instead of testing for
+        # membership.
+        self.rdc = False
 
         # Only used by the fallback in compile_parallel() for a toolchain whose -###
         # names no bundler; normally the compression flags are mirrored from the
@@ -568,6 +574,10 @@ class CompileSpec:
             elif arg.startswith("-o"):
                 self.output = arg[2:]
                 self.have_output = True
+            elif arg in ("-fgpu-rdc", "-fcuda-rdc"):
+                self.rdc = True
+            elif arg in ("-fno-gpu-rdc", "-fno-cuda-rdc"):
+                self.rdc = False
             elif arg == "--offload-compress":
                 self.offload_compress = True
             elif arg.startswith("--offload-compression-level="):
@@ -751,6 +761,10 @@ async def compile_parallel(cmd, offload_archs, spec):
     Raises FallbackToSerial if that cannot be done faithfully. Exits with status 1 if
     one of the sub-compilations reported a genuine compile error (already printed).
     """
+    if spec.rdc and not spec.have_output:
+        # In RDC mode phc writes the output itself, so it has to know where it goes.
+        raise FallbackToSerial("-fgpu-rdc without an explicit -o")
+
     # When compiling different compilation units separately, each one needs a 'CUID'
     # passed to it to help identify which compilation unit an object is part of.
     # Usually this is passed by the clang driver, but since we are emulating the driver
@@ -783,6 +797,12 @@ async def compile_parallel(cmd, offload_archs, spec):
     if info.targets is not None:
         targets = info.targets
         bundle_extra = info.bundle_extra
+    elif spec.rdc:
+        # The whole-program spellings below are wrong for an RDC bundle (`hip-` where
+        # the fat binary says `hipv4-`, a different host triple, a different order),
+        # and guessing would yield an object that looks plausible, links, and
+        # contains no device code.
+        raise FallbackToSerial("the driver's -### output named no -targets")
     else:
         # The original hardcoded spellings, kept for toolchains whose -### does not
         # mention a bundler at all. They assume an x86_64 Linux host.
@@ -803,7 +823,7 @@ async def compile_parallel(cmd, offload_archs, spec):
     debug(f"bundler: {bundler}")
     debug(f"targets: {','.join(targets)}")
     debug(f"cuid:    {cuid}")
-    debug(f"mode:    whole program, "
+    debug(f"mode:    {'-fgpu-rdc' if spec.rdc else 'whole program'}, "
           f"{len(offload_archs)} architectures: {' '.join(offload_archs)}")
 
     with open_jobserver(len(offload_archs)) as jobclient:
@@ -878,59 +898,119 @@ async def compile_parallel(cmd, offload_archs, spec):
                 # The remainder of the commands are all serially executed within the same jobserver
                 # task, the main thread of this process.
 
-                # Whole-program compilation. The device code is packed into a fat
-                # binary which the host compilation then embeds, and the host
-                # compilation writes the final object itself.
-                #
-                # Note: the bundle also needs an entry for the host target, even
-                # though HIP does not use it, hence the -input=/dev/null that
-                # bundle_inputs() places wherever the driver puts the host target.
-                bundle = os.path.join(dir, "bundle.hipfb")
-                bundle_cmd = [bundler, "-type=o"] + bundle_extra + \
-                    ["-targets=" + ",".join(targets)] + \
-                    bundle_inputs(targets, device_inputs, "/dev/null") + \
-                    [f"-output={bundle}"]
-                await run_bundler(bundle_cmd)
+                if not spec.rdc:
+                    # Whole-program compilation. The device code is packed into a fat
+                    # binary which the host compilation then embeds, and the host
+                    # compilation writes the final object itself.
+                    #
+                    # Note: the bundle also needs an entry for the host target, even
+                    # though HIP does not use it, hence the -input=/dev/null that
+                    # bundle_inputs() places wherever the driver puts the host target.
+                    bundle = os.path.join(dir, "bundle.hipfb")
+                    bundle_cmd = [bundler, "-type=o"] + bundle_extra + \
+                        ["-targets=" + ",".join(targets)] + \
+                        bundle_inputs(targets, device_inputs, "/dev/null") + \
+                        [f"-output={bundle}"]
+                    await run_bundler(bundle_cmd)
 
-                bundle_end = time.time()
-                trace(start, bundle_end, f"{spec.output}::bundle")
+                    bundle_end = time.time()
+                    trace(start, bundle_end, f"{spec.output}::bundle")
 
-                # Compile the final executable.
-                # Preprocess the host compilation command.
-                host_cmd = []
-                for arg in cmd:
-                    # This time, we don't need to include any GPU targets to compile for, as we're only
-                    # targeting the host. We can leave the MF/MD/MT and -o options in place this time,
-                    # we actually want to emit the dependency info as well as put the object in the
-                    # original output location.
-                    if arg.startswith("--offload-arch="):
-                        pass
-                    # Also get rid of --offload-jobs, its not needed anymore.
-                    elif arg.startswith("--offload-jobs="):
-                        pass
-                    # Skip any flags related to compression, we'll do that later.
-                    elif arg == "--offload-compress":
-                        pass
-                    elif arg.startswith("--offload-compression-level"):
-                        pass
-                    # Pass on any other options.
-                    else:
-                        host_cmd.append(arg)
+                    # Compile the final executable.
+                    # Preprocess the host compilation command.
+                    host_cmd = []
+                    for arg in cmd:
+                        # This time, we don't need to include any GPU targets to compile for, as we're only
+                        # targeting the host. We can leave the MF/MD/MT and -o options in place this time,
+                        # we actually want to emit the dependency info as well as put the object in the
+                        # original output location.
+                        if arg.startswith("--offload-arch="):
+                            pass
+                        # Also get rid of --offload-jobs, its not needed anymore.
+                        elif arg.startswith("--offload-jobs="):
+                            pass
+                        # Skip any flags related to compression, we'll do that later.
+                        elif arg == "--offload-compress":
+                            pass
+                        elif arg.startswith("--offload-compression-level"):
+                            pass
+                        # Pass on any other options.
+                        else:
+                            host_cmd.append(arg)
 
-                # Only compile the host part of the input file, ignore any device code.
-                host_cmd.append("--offload-host-only")
-                # Ask clang to embed the offload bundle that we produced earlier. Note: this must be
-                # passed to cc1 via -Xclang.
-                host_cmd.append("-Xclang")
-                host_cmd.append("-fcuda-include-gpubinary")
-                host_cmd.append("-Xclang")
-                host_cmd.append(bundle)
-                # And the CUID, as a driver option (see above).
-                host_cmd.extend(cuid_args)
-                await run(host_cmd)
+                    # Only compile the host part of the input file, ignore any device code.
+                    host_cmd.append("--offload-host-only")
+                    # Ask clang to embed the offload bundle that we produced earlier. Note: this must be
+                    # passed to cc1 via -Xclang.
+                    host_cmd.append("-Xclang")
+                    host_cmd.append("-fcuda-include-gpubinary")
+                    host_cmd.append("-Xclang")
+                    host_cmd.append(bundle)
+                    # And the CUID, as a driver option (see above).
+                    host_cmd.extend(cuid_args)
+                    await run(host_cmd)
 
-                host_end = time.time()
-                trace(bundle_end, host_end, spec.output)
+                    host_end = time.time()
+                    trace(bundle_end, host_end, spec.output)
+                else:
+                    # Relocatable device code. There is no fat binary to embed: the host
+                    # object and the per-architecture device bitcode are peers inside one
+                    # bundled object, which the device link later takes apart again. So
+                    # the host compilation goes to a temporary and the bundler writes the
+                    # real output.
+                    host_obj = os.path.join(dir, "host.o")
+
+                    host_cmd = []
+                    it = iter(cmd)
+                    for arg in it:
+                        # Note that, unlike the whole-program path above, the
+                        # --offload-arch list is kept. That is what the driver does for
+                        # its own host-only compilation, and without it the driver shells
+                        # out to rocm_agent_enumerator to look for a local GPU on every
+                        # single compile, which is both slow and noisy.
+                        if arg.startswith("--offload-jobs="):
+                            pass
+                        # Compression is a property of the bundle, not of this compile.
+                        elif arg == "--offload-compress":
+                            pass
+                        elif arg.startswith("--offload-compression-level"):
+                            pass
+                        # The final object is written by the bundler below, not here.
+                        elif arg == "-o":
+                            next(it, None)
+                        elif arg.startswith("-o"):
+                            pass
+                        else:
+                            host_cmd.append(arg)
+
+                    host_cmd.append("--offload-host-only")
+                    host_cmd.extend(cuid_args)
+                    host_cmd.append("-o")
+                    host_cmd.append(host_obj)
+
+                    # clang derives both the name of the dependency file and the rule
+                    # target inside it from -o, which here is a temporary. Left alone, a
+                    # -MD would drop the .d file in phc's temporary directory, and a .d
+                    # file whose rule names that temporary never matches the real object,
+                    # so make would quietly stop rebuilding it when a header changes.
+                    if spec.depfile:
+                        if not spec.depfile_named:
+                            host_cmd.extend(["-MF", os.path.splitext(spec.output)[0] + ".d"])
+                        if not spec.depfile_target:
+                            host_cmd.extend(["-MT", spec.output])
+
+                    await run(host_cmd)
+
+                    host_end = time.time()
+                    trace(start, host_end, spec.output)
+
+                    bundle_cmd = [bundler, "-type=o"] + bundle_extra + \
+                        ["-targets=" + ",".join(targets)] + \
+                        bundle_inputs(targets, device_inputs, host_obj) + \
+                        [f"-output={spec.output}"]
+                    await run_bundler(bundle_cmd)
+
+                    trace(host_end, time.time(), f"{spec.output}::bundle")
         finally:
             for signum, handler in saved_handlers.items():
                 signal.signal(signum, handler)
