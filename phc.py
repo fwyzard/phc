@@ -101,8 +101,9 @@ class JobserverClient:
 
         # Sccache only sets CARGO_MAKEFLAGS and removes the original MAKEFLAGS, so
         # try to parse them both.
-        makeflags = os.environ.get("CARGO_MAKEFLAGS", "")
-        makeflags = os.environ.get("MAKEFLAGS", makeflags)
+        # An empty but present MAKEFLAGS must fall through to CARGO_MAKEFLAGS:
+        # os.environ.get("MAKEFLAGS", makeflags) returns "" rather than the fallback.
+        makeflags = os.environ.get("MAKEFLAGS") or os.environ.get("CARGO_MAKEFLAGS", "")
 
         # ninja/misc/jobserver_pool.py starts a jobserver with a named pipe, but
         # sccache starts a jobserver with an anonymous pipe. So we have to parse
@@ -342,7 +343,7 @@ async def main():
 
             # tasks.task_done() is called after any potential changes to error_event, so we can
             # check here if its set.
-            if error_event.set():
+            if error_event.is_set():
                 # Note: error is already printed.
                 sys.exit(1)
 
@@ -367,7 +368,7 @@ async def main():
             if offload_compress:
                 bundle_cmd.append("-compress")
             if offload_compression_level is not None:
-                bundle_cmd.append("-compression-level={offload_compression_level}")
+                bundle_cmd.append(f"-compression-level={offload_compression_level}")
 
             await run(bundle_cmd)
 
@@ -559,9 +560,9 @@ async def compile_device(cmd, arch, output, cuid, host_output, error_event):
         # Get rid of any dependency information flags: We don't want to regenerate
         # these files every time. Besides, clang gives a warning about not having used
         # these options if they are passed with a device-only compilation.
-        elif arg == "-MD":
+        elif arg == "-MD" or arg == "-MMD":
             pass
-        elif arg == "-MT" or arg == "-MF":
+        elif arg == "-MT" or arg == "-MQ" or arg == "-MF":
              next(it)
         # Get rid of the original output file. We'll add the new one later.
         elif arg == "-o":
